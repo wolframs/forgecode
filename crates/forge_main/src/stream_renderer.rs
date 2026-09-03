@@ -82,6 +82,9 @@ pub enum Style {
     #[default]
     Normal,
     Dimmed,
+    /// Dimmed content routed to the error stream, so that redirecting stdout
+    /// captures the answer only.
+    DimmedErr,
 }
 
 impl Style {
@@ -89,8 +92,13 @@ impl Style {
     fn apply(self, content: String) -> String {
         match self {
             Self::Normal => content,
-            Self::Dimmed => content.dimmed().to_string(),
+            Self::Dimmed | Self::DimmedErr => content.dimmed().to_string(),
         }
+    }
+
+    /// Returns true when content in this style belongs on the error stream.
+    fn is_err(self) -> bool {
+        matches!(self, Self::DimmedErr)
     }
 }
 
@@ -126,6 +134,12 @@ impl<P: ConsoleWriter + 'static> StreamingWriter<P> {
     /// Writes markdown content with dimmed styling (for reasoning blocks).
     pub fn write_dimmed(&mut self, text: &str) -> Result<()> {
         self.write_styled(text, Style::Dimmed)
+    }
+
+    /// Writes markdown content with dimmed styling to the error stream, so the
+    /// primary stream carries only the answer.
+    pub fn write_dimmed_err(&mut self, text: &str) -> Result<()> {
+        self.write_styled(text, Style::DimmedErr)
     }
 
     /// Finishes any active renderer.
@@ -215,8 +229,13 @@ impl<P: ConsoleWriter + 'static> io::Write for StreamDirectWriter<P> {
             Err(_) => buf.to_str_lossy(),
         };
         let styled = self.style.apply(content.into_owned());
-        self.printer.write(styled.as_bytes())?;
-        self.printer.flush()?;
+        if self.style.is_err() {
+            self.printer.write_err(styled.as_bytes())?;
+            self.printer.flush_err()?;
+        } else {
+            self.printer.write(styled.as_bytes())?;
+            self.printer.flush()?;
+        }
 
         // Track if we ended on a newline - only safe to show spinner at line start
         if buf.last() == Some(&b'\n') {

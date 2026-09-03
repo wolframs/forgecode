@@ -118,6 +118,12 @@ pub struct Agent {
     /// Flag to enable/disable tool support for this agent.
     pub tool_supported: Option<bool>,
 
+    /// When true, the agent's system prompt is used verbatim: the built-in
+    /// `forge-custom-agent-template.md` block (system information, tool usage
+    /// instructions and non-negotiable rules) is not appended. Defaults to
+    /// false.
+    pub bare_system_prompt: Option<bool>,
+
     /// Path to the agent definition file, if loaded from a file
     pub path: Option<String>,
 
@@ -193,6 +199,7 @@ impl Agent {
             provider,
             model,
             tool_supported: Default::default(),
+            bare_system_prompt: Default::default(),
             system_prompt: Default::default(),
             user_prompt: Default::default(),
             tools: Default::default(),

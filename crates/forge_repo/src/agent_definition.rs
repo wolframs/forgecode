@@ -19,6 +19,13 @@ pub(crate) struct AgentDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_supported: Option<bool>,
 
+    /// When true, the agent's markdown body is used as the system prompt
+    /// verbatim and the built-in `forge-custom-agent-template.md` block is
+    /// not appended. Defaults to false.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bare_system_prompt: Option<bool>,
+
     // Unique identifier for the agent
     pub id: AgentId,
 
@@ -143,6 +150,7 @@ impl AgentDefinition {
     pub fn into_agent(self, provider_id: ProviderId, model_id: ModelId) -> Agent {
         Agent {
             tool_supported: self.tool_supported,
+            bare_system_prompt: self.bare_system_prompt,
             id: self.id,
             title: self.title,
             description: self.description,

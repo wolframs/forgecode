@@ -4219,7 +4219,13 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 }
             }
             ChatResponse::TaskReasoning { content } => {
-                writer.write_dimmed(&content)?;
+                // In print/non-interactive mode the reasoning stream is routed to
+                // stderr, so `forge -p ... > answer.md` captures the answer only.
+                if self.cli.is_interactive() {
+                    writer.write_dimmed(&content)?;
+                } else {
+                    writer.write_dimmed_err(&content)?;
+                }
             }
             ChatResponse::TaskComplete => {
                 writer.finish()?;
@@ -4238,6 +4244,14 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     }
 
     async fn should_continue(&mut self) -> anyhow::Result<bool> {
+        // A non-interactive run has no TTY to prompt on: stop instead of hanging or
+        // failing on the confirm widget.
+        if !self.cli.is_interactive() {
+            self.spinner
+                .ewrite_ln("Limit reached; stopping (non-interactive mode).")?;
+            return Ok(false);
+        }
+
         let should_continue = ForgeWidget::confirm("Do you want to continue anyway?")
             .with_default(true)
             .prompt()?;

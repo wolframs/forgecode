@@ -1,5 +1,6 @@
 use forge_domain::{ChatCompletionMessage, CommandOutput, Content, FinishReason};
 use insta::assert_snapshot;
+use pretty_assertions::assert_eq;
 
 use crate::ShellOutput;
 use crate::orch_spec::orch_runner::TestContext;
@@ -13,6 +14,37 @@ async fn test_system_prompt() {
     ctx.run("This is a test").await.unwrap();
     let system_messages = ctx.output.system_messages().unwrap().join("\n\n");
     assert_snapshot!(system_messages);
+}
+
+#[tokio::test]
+async fn test_system_prompt_bare_system_prompt() {
+    // With `bare_system_prompt` set, the agent body is the entire system prompt:
+    // the built-in `forge-custom-agent-template.md` block must not be appended.
+    let fixture = TestContext::default();
+    let agent = fixture.agent.clone().bare_system_prompt(true);
+    let mut ctx = fixture.agent(agent).mock_assistant_responses(vec![
+        ChatCompletionMessage::assistant(Content::full("Sure")).finish_reason(FinishReason::Stop),
+    ]);
+
+    ctx.run("This is a test").await.unwrap();
+
+    let actual = ctx.output.system_messages().unwrap();
+    let expected = vec!["You are Forge"];
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn test_system_prompt_without_bare_system_prompt() {
+    // Default behaviour (flag unset): the built-in block is still appended.
+    let mut ctx = TestContext::default().mock_assistant_responses(vec![
+        ChatCompletionMessage::assistant(Content::full("Sure")).finish_reason(FinishReason::Stop),
+    ]);
+
+    ctx.run("This is a test").await.unwrap();
+
+    let system_messages = ctx.output.system_messages().unwrap();
+    assert_eq!(system_messages.len(), 2);
+    assert!(system_messages[1].contains("<non_negotiable_rules>"));
 }
 
 #[tokio::test]
