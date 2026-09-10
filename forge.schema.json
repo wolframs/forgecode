@@ -71,6 +71,14 @@
         "null"
       ]
     },
+    "extra_body": {
+      "description": "Extra top-level JSON members merged into every chat-completion request\nbody sent to an OpenAI-protocol provider.\n\nSome OpenAI-compatible endpoints require a vendor-specific top-level\nbody field that Forge's request DTO has no typed field for — for\nexample `provider = \"openrouter\"` on marketplace endpoints that\notherwise route to a seller the account cannot buy from. Each entry\nis inserted into the serialized request object *after* Forge has\nbuilt it, so a key that collides with a Forge-set field wins.\n\nConfigure it as a table in `.forge.toml`:\n\n```toml\n[extra_body]\nprovider = \"openrouter\"\n```\n\nor through the environment, like any other config key:\n`FORGE_EXTRA_BODY__PROVIDER=openrouter`.\n\nWhen absent or empty the request body is byte-for-byte what it was\nbefore this option existed.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    },
     "http": {
       "description": "HTTP client settings including proxy, TLS, and timeout configuration.",
       "anyOf": [

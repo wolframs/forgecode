@@ -55,15 +55,56 @@ fn prepare_copilot_auto_request(mut request: Request) -> Request {
     request
 }
 
+/// Serializes a chat request, merging any configured `extra_body` members as
+/// top-level fields of the JSON object.
+///
+/// With no extras (the default) this is exactly `serde_json::to_vec(request)`
+/// — the early return keeps the wire body byte-identical for every provider
+/// that does not configure the option.
+fn serialize_request(
+    request: &Request,
+    extra_body: Option<&std::collections::HashMap<String, serde_json::Value>>,
+) -> Result<Vec<u8>> {
+    let extras = match extra_body {
+        Some(extras) if !extras.is_empty() => extras,
+        _ => return serde_json::to_vec(request).with_context(|| "Failed to serialize request"),
+    };
+
+    let mut value = serde_json::to_value(request).with_context(|| "Failed to serialize request")?;
+    match value.as_object_mut() {
+        Some(object) => {
+            for (key, extra) in extras {
+                object.insert(key.clone(), extra.clone());
+            }
+        }
+        // A Request always serializes to a JSON object; if that ever stops
+        // being true, send the request rather than failing the turn.
+        None => tracing::warn!("extra_body ignored: request did not serialize to a JSON object"),
+    }
+
+    serde_json::to_vec(&value).with_context(|| "Failed to serialize request")
+}
+
 #[derive(Clone)]
 struct OpenAIProvider<H> {
     provider: Provider<Url>,
     http: Arc<H>,
+    /// Extra top-level request-body members from `ForgeConfig::extra_body`.
+    extra_body: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 impl<H: HttpInfra> OpenAIProvider<H> {
     pub fn new(provider: Provider<Url>, http: Arc<H>) -> Self {
-        Self { provider, http }
+        Self { provider, http, extra_body: None }
+    }
+
+    /// Attaches the configured `extra_body` members to this provider client.
+    pub fn extra_body(
+        mut self,
+        extra_body: Option<std::collections::HashMap<String, serde_json::Value>>,
+    ) -> Self {
+        self.extra_body = extra_body;
+        self
     }
 
     // OpenRouter optional headers ref: https://openrouter.ai/docs/api-reference/overview#headers
@@ -235,8 +276,7 @@ impl<H: HttpInfra> OpenAIProvider<H> {
             "Connecting Upstream"
         );
 
-        let json_bytes =
-            serde_json::to_vec(&request).with_context(|| "Failed to serialize request")?;
+        let json_bytes = serialize_request(&request, self.extra_body.as_ref())?;
 
         let es = self
             .http
@@ -399,7 +439,8 @@ impl<F: HttpInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + 'stat
         let retry_config = config.retry.unwrap_or_default();
         let merge_system_messages = config.merge_system_messages;
         let provider_id = provider.id.clone();
-        let provider_client = OpenAIProvider::new(provider, self.infra.clone());
+        let provider_client =
+            OpenAIProvider::new(provider, self.infra.clone()).extra_body(config.extra_body);
         let stream = provider_client
             .chat(model_id, context, merge_system_messages)
             .await
@@ -713,6 +754,65 @@ mod tests {
         assert!(actual.is_err());
         insta::assert_snapshot!(normalize_ports(format!("{:#?}", actual.unwrap_err())));
         Ok(())
+    }
+
+    #[test]
+    fn test_serialize_request_without_extra_body_is_unchanged() {
+        let fixture = Request {
+            model: Some(ModelId::new("kimi-k3")),
+            temperature: Some(1.0),
+            ..Default::default()
+        };
+
+        let actual_none = serialize_request(&fixture, None).unwrap();
+        let actual_empty = serialize_request(&fixture, Some(&HashMap::new())).unwrap();
+        let expected = serde_json::to_vec(&fixture).unwrap();
+
+        assert_eq!(actual_none, expected);
+        assert_eq!(actual_empty, expected);
+    }
+
+    #[test]
+    fn test_serialize_request_merges_extra_body() {
+        let fixture = Request {
+            model: Some(ModelId::new("kimi-k2-thinking")),
+            ..Default::default()
+        };
+        let mut extra = HashMap::new();
+        extra.insert(
+            "provider".to_string(),
+            serde_json::Value::String("openrouter".to_string()),
+        );
+
+        let bytes = serialize_request(&fixture, Some(&extra)).unwrap();
+        let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(actual["provider"], serde_json::json!("openrouter"));
+        assert_eq!(actual["model"], serde_json::json!("kimi-k2-thinking"));
+    }
+
+    #[test]
+    fn test_serialize_request_extra_body_accepts_arrays_and_overrides() {
+        let fixture = Request {
+            model: Some(ModelId::new("kimi-k2-thinking")),
+            temperature: Some(1.0),
+            ..Default::default()
+        };
+        let mut extra = HashMap::new();
+        extra.insert(
+            "provider".to_string(),
+            serde_json::json!(["openrouter", "venice"]),
+        );
+        extra.insert("temperature".to_string(), serde_json::json!(0.5));
+
+        let bytes = serialize_request(&fixture, Some(&extra)).unwrap();
+        let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            actual["provider"],
+            serde_json::json!(["openrouter", "venice"])
+        );
+        assert_eq!(actual["temperature"], serde_json::json!(0.5));
     }
 
     #[tokio::test]

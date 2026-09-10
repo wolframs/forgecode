@@ -334,6 +334,32 @@ pub struct ForgeConfig {
     /// user or assistant turns (e.g. vLLM, NVIDIA NIM).
     #[serde(default)]
     pub merge_system_messages: bool,
+
+    /// Extra top-level JSON members merged into every chat-completion request
+    /// body sent to an OpenAI-protocol provider.
+    ///
+    /// Some OpenAI-compatible endpoints require a vendor-specific top-level
+    /// body field that Forge's request DTO has no typed field for — for
+    /// example `provider = "openrouter"` on marketplace endpoints that
+    /// otherwise route to a seller the account cannot buy from. Each entry
+    /// is inserted into the serialized request object *after* Forge has
+    /// built it, so a key that collides with a Forge-set field wins.
+    ///
+    /// Configure it as a table in `.forge.toml`:
+    ///
+    /// ```toml
+    /// [extra_body]
+    /// provider = "openrouter"
+    /// ```
+    ///
+    /// or through the environment, like any other config key:
+    /// `FORGE_EXTRA_BODY__PROVIDER=openrouter`.
+    ///
+    /// When absent or empty the request body is byte-for-byte what it was
+    /// before this option existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[dummy(expr = "None")]
+    pub extra_body: Option<HashMap<String, serde_json::Value>>,
 }
 
 impl ForgeConfig {
