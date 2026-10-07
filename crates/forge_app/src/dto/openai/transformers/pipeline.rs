@@ -15,6 +15,7 @@ use super::normalize_tool_schema::{
 use super::reasoning_content::ReasoningContent;
 use super::set_cache::SetCache;
 use super::set_reasoning_effort::SetReasoningEffort;
+use super::skip_thought_signature::DefaultThoughtSignature;
 use super::strip_thought_signature::StripThoughtSignature;
 use super::tool_choice::SetToolChoice;
 use super::trim_tool_call_ids::TrimToolCallIds;
@@ -62,6 +63,10 @@ impl Transformer for ProviderPipeline<'_> {
         // Strip thought signatures for all models except gemini-3
         let strip_thought_signature =
             StripThoughtSignature.when(move |req: &Request| !is_gemini3_model(req));
+
+        // A gemini-3 backend refuses a step whose first tool call carries no
+        // thought signature; one that has none goes back with the skip value.
+        let default_thought_signature = DefaultThoughtSignature.when(is_gemini3_model);
 
         let open_ai_compat = MakeOpenAiCompat.when(move |_| !supports_open_router_params(provider));
 
@@ -114,6 +119,7 @@ impl Transformer for ProviderPipeline<'_> {
         let mut combined = zai_thinking
             .pipe(or_transformers)
             .pipe(strip_thought_signature)
+            .pipe(default_thought_signature)
             .pipe(set_reasoning_effort)
             .pipe(open_ai_compat)
             .pipe(github_copilot_reasoning)
@@ -688,6 +694,91 @@ mod tests {
                 .unwrap()
                 .thought_signature,
             Some("sig123".to_string())
+        );
+    }
+
+    /// Run F, conversation 9b9cdbba-b067-47ba-a016-9b11adbad49f, sixth
+    /// response: the upstream answered in OpenRouter's shape, with a reference
+    /// for the tool call in `reasoning_details` and no `extra_content`. The
+    /// chunk is rebuilt from the stored message (the wire was not recorded);
+    /// every value in it is the recorded one. The request that followed was
+    /// refused with "Function call is missing a thought_signature in
+    /// functionCall parts". With reasoning details dropped (the seat's
+    /// setting) the call has no signature of its own and goes back with the
+    /// skip value Google documents, not with the reference.
+    #[tokio::test]
+    async fn test_gemini3_unsigned_tool_call_goes_back_with_the_skip_value() {
+        use forge_domain::{
+            BoxStream, ChatCompletionMessage, Context, DropReasoningDetails, ResultStreamExt,
+            ToolResult,
+        };
+
+        use crate::dto::openai::Response;
+
+        let chunk = serde_json::json!({
+            "id": "01M47N3X",
+            "object": "chat.completion.chunk",
+            "model": "gemini-3.1-pro-preview",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_23281984",
+                        "type": "function",
+                        "function": {
+                            "name": "mcp_papertool_tool_search_papers",
+                            "arguments": "{\"query\":\"\\\"Hawthorne\\\" \\\"Isaacs\\\" \\\"Littlejohn\\\" \\\"bounding\\\"\"}"
+                        }
+                    }],
+                    "reasoning_details": [{
+                        "type": "reasoning.encrypted",
+                        "data": "ZTI0ODMwYTctNWNkNi00MmZlLTk5OGItZWU1MzllNzJiOWMz",
+                        "id": "call_23281984",
+                        "format": "google-gemini-v1",
+                        "index": 0
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response: Response = serde_json::from_value(chunk).unwrap();
+        let stream: BoxStream<ChatCompletionMessage, anyhow::Error> = Box::pin(tokio_stream::iter(
+            vec![ChatCompletionMessage::try_from(response)],
+        ));
+        let message = stream.into_full(false).await.unwrap();
+
+        // As the orchestrator stores the turn and, with reasoning not enabled
+        // for the agent (the seat's setting), prepares the next request.
+        let tool_call = message.tool_calls[0].clone();
+        let tool_result = ToolResult::new(tool_call.name.clone())
+            .call_id(tool_call.call_id.clone().unwrap())
+            .success("{}");
+        let context = Context::default().append_message(
+            message.content.clone(),
+            message.thought_signature.clone(),
+            message.reasoning.clone(),
+            message.reasoning_details.clone(),
+            message.usage,
+            vec![(tool_call, tool_result)],
+            message.phase,
+        );
+        let context = DropReasoningDetails.transform(context);
+
+        let provider = Provider { id: ProviderId::OPENAI_COMPATIBLE, ..openai("surplus") };
+        let fixture = Request::from(context).model(ModelId::new("gemini-3.1-pro-preview"));
+        let actual =
+            serde_json::to_value(ProviderPipeline::new(&provider, false).transform(fixture))
+                .unwrap();
+
+        let expected = serde_json::json!({
+            "google": { "thought_signature": "skip_thought_signature_validator" }
+        });
+        assert_eq!(
+            actual["messages"][0]["tool_calls"][0]["extra_content"],
+            expected
         );
     }
 

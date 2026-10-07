@@ -37,6 +37,49 @@ impl MockServer {
             .await
     }
 
+    /// Like `mock_post_error`, for requests whose body matches `body_regex`
+    /// only, expected exactly `hits` times.
+    pub async fn mock_post_error_matching(
+        &mut self,
+        path: &str,
+        body_regex: &str,
+        body: &str,
+        status: usize,
+        hits: usize,
+    ) -> Mock {
+        self.server
+            .mock("POST", path)
+            .match_body(mockito::Matcher::Regex(body_regex.to_string()))
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .expect(hits)
+            .create_async()
+            .await
+    }
+
+    /// Mock a POST path answering requests whose body matches `body_regex`
+    /// with an SSE stream of the given events, expected exactly once.
+    pub async fn mock_post_stream_matching(
+        &mut self,
+        path: &str,
+        body_regex: &str,
+        events: Vec<String>,
+    ) -> Mock {
+        let mut sse_body = events.join("\n\n");
+        sse_body.push_str("\n\n");
+        self.server
+            .mock("POST", path)
+            .match_body(mockito::Matcher::Regex(body_regex.to_string()))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("cache-control", "no-cache")
+            .with_body(sse_body)
+            .expect(1)
+            .create_async()
+            .await
+    }
+
     /// Mock any POST path returning 200 with `Content-Type: application/json`
     /// (not `text/event-stream`).  Used to simulate an `InvalidContentType`
     /// error from the SSE client.

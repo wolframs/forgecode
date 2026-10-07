@@ -7,18 +7,18 @@ use forge_app::domain::{
 };
 use forge_app::dto::openai::{
     COPILOT_AUTO_MODEL_ID, CopilotListModelResponse, ListModelResponse, ProviderPipeline, Request,
-    Response, copilot_auto_model,
+    Response, SkipThoughtSignatures, copilot_auto_model,
 };
 use forge_app::{EnvironmentInfra, HttpInfra};
 use forge_domain::{ChatRepository, Provider};
 use forge_infra::sanitize_headers;
 use reqwest::header::AUTHORIZATION;
 use tokio_stream::StreamExt;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::provider::event::into_chat_completion_message;
-use crate::provider::retry::into_retry;
+use crate::provider::retry::{get_api_status_code, into_retry};
 use crate::provider::utils::{create_headers, format_http_context, join_url};
 
 /// Enhances error messages with provider-specific helpful information
@@ -38,6 +38,21 @@ fn enhance_error(error: anyhow::Error, provider_id: &ProviderId) -> anyhow::Erro
     }
 
     error
+}
+
+/// Checks if the model is a gemini-3 model, whose backend validates the
+/// thought signatures of tool calls.
+fn is_gemini3_model(model: &ModelId) -> bool {
+    model.as_str().contains("gemini-3")
+}
+
+/// Checks if the provider refused the request for a thought signature: a 400
+/// naming one ("Function call is missing a thought_signature", "Corrupted
+/// thought signature", "Thought signature is not valid").
+fn is_thought_signature_refusal(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_lowercase();
+    get_api_status_code(error) == Some(400)
+        && (message.contains("thought signature") || message.contains("thought_signature"))
 }
 
 /// Prepares a request for GitHub Copilot's synthetic "auto" model.
@@ -254,10 +269,15 @@ impl<H: HttpInfra> OpenAIProvider<H> {
         model: &ModelId,
         context: ChatContext,
         merge_system_messages: bool,
+        skip_thought_signatures: bool,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
         let mut request = Request::from(context).model(model.clone());
         let mut pipeline = ProviderPipeline::new(&self.provider, merge_system_messages);
         request = pipeline.transform(request);
+
+        if skip_thought_signatures {
+            request = SkipThoughtSignatures.transform(request);
+        }
 
         if self.provider.id == ProviderId::GITHUB_COPILOT && model.as_str() == COPILOT_AUTO_MODEL_ID
         {
@@ -397,7 +417,31 @@ impl<T: HttpInfra> OpenAIProvider<T> {
         context: ChatContext,
         merge_system_messages: bool,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
-        self.inner_chat(model, context, merge_system_messages).await
+        if !is_gemini3_model(model) {
+            return self
+                .inner_chat(model, context, merge_system_messages, false)
+                .await;
+        }
+
+        // A signature can stop being valid under a conversation (another
+        // upstream, or age). A request refused for its signatures is sent
+        // once more with every signature replaced by the skip value; a second
+        // refusal is returned as it is.
+        let mut stream = self
+            .inner_chat(model, context.clone(), merge_system_messages, false)
+            .await?;
+        match stream.next().await {
+            Some(Err(error)) if is_thought_signature_refusal(&error) => {
+                warn!(
+                    model = %model,
+                    "Thought signature refused by upstream; retrying once with every signature replaced by the skip value (degraded turn)"
+                );
+                self.inner_chat(model, context, merge_system_messages, true)
+                    .await
+            }
+            Some(first) => Ok(Box::pin(tokio_stream::once(first).chain(stream))),
+            None => Ok(stream),
+        }
     }
 
     pub async fn models(&self) -> Result<Vec<forge_app::domain::Model>> {
@@ -595,11 +639,15 @@ mod tests {
 
         async fn http_eventsource(
             &self,
-            _url: &Url,
-            _headers: Option<HeaderMap>,
-            _body: Bytes,
+            url: &Url,
+            headers: Option<HeaderMap>,
+            body: Bytes,
         ) -> anyhow::Result<EventSource> {
-            unimplemented!()
+            let mut request = self.client.post(url.clone());
+            if let Some(headers) = headers {
+                request = request.headers(headers);
+            }
+            Ok(EventSource::new(request.body(body)).map_err(|e| anyhow::anyhow!(e))?)
         }
     }
 
@@ -656,6 +704,190 @@ mod tests {
 
     fn create_empty_response() -> serde_json::Value {
         serde_json::json!({ "data": [] })
+    }
+
+    /// The marketplace's refusal as recorded by the probe on 2026-10-07
+    /// (`/tmp/gsig-probe/resp-A.body`, first line).
+    const CORRUPTED_SIGNATURE_BODY: &str = r#"{"error":{"type":"invalid_request_error","code":"request_rejected","message":"[{\n  \"error\": {\n    \"code\": 400,\n    \"message\": \"Corrupted thought signature.\",\n    \"status\": \"INVALID_ARGUMENT\"\n  }\n}]"}}"#;
+
+    /// The refusal of Run F's seventh request, as the lane's log recorded it.
+    const MISSING_SIGNATURE_BODY: &str = r#"{"error":{"type":"invalid_request_error","code":"request_rejected","message":"Function call is missing a thought_signature in functionCall parts."}}"#;
+
+    const SIGNED: &str = "AY89a18rTa";
+    const SKIPPED: &str = "skip_thought_signature_validator";
+
+    fn create_chat_provider(server_url: &str) -> anyhow::Result<OpenAIProvider<MockHttpClient>> {
+        let mut provider = create_provider(server_url)?;
+        provider.provider.id = ProviderId::OPENAI_COMPATIBLE;
+        provider.provider.url = Url::parse(&format!("{server_url}/chat/completions"))?;
+        Ok(provider)
+    }
+
+    /// One assistant step with a signed tool call and its result, as stored.
+    fn signed_tool_call_context() -> ChatContext {
+        let tool_call = forge_domain::ToolCallFull {
+            name: forge_domain::ToolName::new("mcp_papertool_tool_search_papers"),
+            call_id: Some(forge_domain::ToolCallId::new("call_162924")),
+            arguments: forge_domain::ToolCallArguments::from_json("{}"),
+            thought_signature: Some(SIGNED.to_string()),
+        };
+        let tool_result = forge_domain::ToolResult::new(tool_call.name.clone())
+            .call_id(tool_call.call_id.clone().unwrap())
+            .success("{}");
+        ChatContext::default().append_message(
+            "",
+            None,
+            None,
+            None,
+            Default::default(),
+            vec![(tool_call, tool_result)],
+            None,
+        )
+    }
+
+    fn answer_events() -> Vec<String> {
+        vec![
+            r#"data: {"choices":[{"delta":{"content":"I rule the objection fixable.","role":"assistant"},"index":0}],"created":1791389308,"id":"eG7G","model":"gemini-3.1-pro-preview","object":"chat.completion.chunk"}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ]
+    }
+
+    async fn collect(
+        provider: &OpenAIProvider<MockHttpClient>,
+        model: &str,
+    ) -> Vec<anyhow::Result<ChatCompletionMessage>> {
+        match provider
+            .chat(&ModelId::new(model), signed_tool_call_context(), false)
+            .await
+        {
+            Ok(stream) => stream.collect().await,
+            Err(error) => vec![Err(error)],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_refused_signature_is_sent_once_more_with_skip_value() -> anyhow::Result<()> {
+        let mut fixture = MockServer::new().await;
+        let refused = fixture
+            .mock_post_error_matching(
+                "/chat/completions",
+                SIGNED,
+                CORRUPTED_SIGNATURE_BODY,
+                400,
+                1,
+            )
+            .await;
+        let accepted = fixture
+            .mock_post_stream_matching("/chat/completions", SKIPPED, answer_events())
+            .await;
+        let provider = create_chat_provider(&fixture.url())?;
+
+        let actual = collect(&provider, "gemini-3.1-pro-preview").await;
+
+        refused.assert_async().await;
+        accepted.assert_async().await;
+        let content = actual
+            .into_iter()
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|message| message.content)
+            .map(|content| content.as_str().to_string())
+            .collect::<String>();
+        assert_eq!(content, "I rule the objection fixable.");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_chat_missing_signature_refusal_is_retried_too() -> anyhow::Result<()> {
+        let mut fixture = MockServer::new().await;
+        let refused = fixture
+            .mock_post_error_matching("/chat/completions", SIGNED, MISSING_SIGNATURE_BODY, 400, 1)
+            .await;
+        let accepted = fixture
+            .mock_post_stream_matching("/chat/completions", SKIPPED, answer_events())
+            .await;
+        let provider = create_chat_provider(&fixture.url())?;
+
+        let actual = collect(&provider, "gemini-3.1-pro-preview").await;
+
+        refused.assert_async().await;
+        accepted.assert_async().await;
+        assert!(actual.iter().all(|item| item.is_ok()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_chat_second_signature_refusal_is_returned() -> anyhow::Result<()> {
+        let mut fixture = MockServer::new().await;
+        let first = fixture
+            .mock_post_error_matching(
+                "/chat/completions",
+                SIGNED,
+                CORRUPTED_SIGNATURE_BODY,
+                400,
+                1,
+            )
+            .await;
+        // A different refusal from the first, so the test tells which of the
+        // two is returned.
+        let second = fixture
+            .mock_post_error_matching("/chat/completions", SKIPPED, MISSING_SIGNATURE_BODY, 400, 1)
+            .await;
+        let provider = create_chat_provider(&fixture.url())?;
+
+        let actual = collect(&provider, "gemini-3.1-pro-preview").await;
+
+        first.assert_async().await;
+        second.assert_async().await;
+        assert_eq!(actual.len(), 1);
+        let error = format!("{:#}", actual[0].as_ref().unwrap_err());
+        assert!(error.contains("missing a thought_signature"), "{error}");
+        assert!(!error.contains("Corrupted thought signature"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_chat_other_refusal_is_not_retried() -> anyhow::Result<()> {
+        let mut fixture = MockServer::new().await;
+        let refused = fixture
+            .mock_post_error_matching(
+                "/chat/completions",
+                SIGNED,
+                r#"{"error":{"message":"Invalid JSON payload received."}}"#,
+                400,
+                1,
+            )
+            .await;
+        let provider = create_chat_provider(&fixture.url())?;
+
+        let actual = collect(&provider, "gemini-3.1-pro-preview").await;
+
+        refused.assert_async().await;
+        assert_eq!(actual.len(), 1);
+        assert!(actual[0].is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_chat_signature_refusal_is_not_retried_for_other_models() -> anyhow::Result<()> {
+        let mut fixture = MockServer::new().await;
+        let refused = fixture
+            .mock_post_error_matching(
+                "/chat/completions",
+                "call_162924",
+                CORRUPTED_SIGNATURE_BODY,
+                400,
+                1,
+            )
+            .await;
+        let provider = create_chat_provider(&fixture.url())?;
+
+        let actual = collect(&provider, "gemini-2.5-pro").await;
+
+        refused.assert_async().await;
+        assert_eq!(actual.len(), 1);
+        assert!(actual[0].is_err());
+        Ok(())
     }
 
     #[tokio::test]

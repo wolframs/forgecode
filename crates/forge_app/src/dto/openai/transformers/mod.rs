@@ -11,6 +11,7 @@ mod pipeline;
 mod reasoning_content;
 mod set_cache;
 mod set_reasoning_effort;
+mod skip_thought_signature;
 mod strip_thought_signature;
 mod tool_choice;
 mod trim_tool_call_ids;
@@ -18,3 +19,4 @@ mod when_model;
 mod zai_reasoning;
 
 pub use pipeline::ProviderPipeline;
+pub use skip_thought_signature::{SKIP_THOUGHT_SIGNATURE, SkipThoughtSignatures};

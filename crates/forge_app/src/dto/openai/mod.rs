@@ -14,4 +14,4 @@ pub use reasoning::*;
 pub use request::*;
 pub use response::*;
 pub use tool_choice::*;
-pub use transformers::ProviderPipeline;
+pub use transformers::{ProviderPipeline, SKIP_THOUGHT_SIGNATURE, SkipThoughtSignatures};
