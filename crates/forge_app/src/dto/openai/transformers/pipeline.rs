@@ -170,13 +170,28 @@ fn is_xiaomi_mimo_provider(provider: &Provider<Url>) -> bool {
     provider.id == ProviderId::XIAOMI_MIMO
 }
 
-/// Checks if the request model is a gemini-3 model (which supports thought
-/// signatures)
+/// Checks if the request model is a gemini-3-or-later model (which supports
+/// thought signatures)
 fn is_gemini3_model(req: &Request) -> bool {
     req.model
         .as_ref()
-        .map(|m| m.as_str().contains("gemini-3"))
+        .map(|m| validates_thought_signatures(m.as_str()))
         .unwrap_or(false)
+}
+
+/// Whether a model id names a Gemini generation whose backend validates the
+/// thought signatures of tool calls: Gemini 3 and every later major version
+/// (`gemini-3.1-pro-preview`, `gemini-4-argon`, `google/gemini-4-argon`).
+/// Gemini 4 Argon behind an OpenAI-compatible marketplace refused its second
+/// tool step when the signature was stripped (2026-10-16).
+fn validates_thought_signatures(model: &str) -> bool {
+    model.match_indices("gemini-").any(|(at, tag)| {
+        let digits: String = model[at + tag.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse::<u32>().is_ok_and(|major| major >= 3)
+    })
 }
 
 /// function checks if provider supports open-router parameters.
@@ -189,6 +204,17 @@ fn supports_open_router_params(provider: &Provider<Url>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_thought_signature_models_are_gemini_3_and_later() {
+        for id in ["gemini-3.1-pro-preview", "gemini-4-argon", "google/gemini-4-argon",
+                   "gemini-3-flash", "gemini-10-x"] {
+            assert!(super::validates_thought_signatures(id), "{id}");
+        }
+        for id in ["gemini-2.5-pro", "gemini-pro", "gpt-6-astra", "kimi-k3", "gemini-"] {
+            assert!(!super::validates_thought_signatures(id), "{id}");
+        }
+    }
+
     use std::collections::HashMap;
     use std::str::FromStr;
 

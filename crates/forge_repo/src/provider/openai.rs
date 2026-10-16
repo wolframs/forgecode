@@ -40,10 +40,25 @@ fn enhance_error(error: anyhow::Error, provider_id: &ProviderId) -> anyhow::Erro
     error
 }
 
-/// Checks if the model is a gemini-3 model, whose backend validates the
-/// thought signatures of tool calls.
+/// Checks if the model is a gemini-3-or-later model, whose backend validates
+/// the thought signatures of tool calls.
 fn is_gemini3_model(model: &ModelId) -> bool {
-    model.as_str().contains("gemini-3")
+    validates_thought_signatures(model.as_str())
+}
+
+/// Whether a model id names a Gemini generation whose backend validates the
+/// thought signatures of tool calls: Gemini 3 and every later major version
+/// (`gemini-3.1-pro-preview`, `gemini-4-argon`, `google/gemini-4-argon`).
+/// Gemini 4 Argon behind an OpenAI-compatible marketplace refused its second
+/// tool step when the signature was stripped (2026-10-16).
+fn validates_thought_signatures(model: &str) -> bool {
+    model.match_indices("gemini-").any(|(at, tag)| {
+        let digits: String = model[at + tag.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse::<u32>().is_ok_and(|major| major >= 3)
+    })
 }
 
 /// Checks if the provider refused the request for a thought signature: a 400
