@@ -22,12 +22,18 @@ struct TitleGenerationState {
 pub struct TitleGenerationHandler<S> {
     services: Arc<S>,
     title_tasks: Arc<DashMap<ConversationId, TitleGenerationState>>,
+    /// Set by `FORGE_NO_TITLE=1`: no title request is sent at all.
+    disabled: bool,
 }
 
 impl<S> TitleGenerationHandler<S> {
     /// Creates a new title generation handler.
     pub fn new(services: Arc<S>) -> Self {
-        Self { services, title_tasks: Arc::new(DashMap::new()) }
+        Self {
+            services,
+            title_tasks: Arc::new(DashMap::new()),
+            disabled: std::env::var("FORGE_NO_TITLE").is_ok_and(|v| v == "1"),
+        }
     }
 }
 
@@ -38,7 +44,7 @@ impl<S: AgentService> EventHandle<EventData<StartPayload>> for TitleGenerationHa
         event: &EventData<StartPayload>,
         conversation: &mut Conversation,
     ) -> anyhow::Result<()> {
-        if conversation.title.is_some() {
+        if self.disabled || conversation.title.is_some() {
             return Ok(());
         }
 
@@ -186,6 +192,25 @@ mod tests {
             .unwrap();
 
         assert!(!handler.title_tasks.contains_key(&conversation.id));
+    }
+
+    #[tokio::test]
+    async fn test_start_skips_if_disabled() {
+        let (mut handler, mut conversation) = setup("test message");
+        handler.disabled = true;
+
+        handler
+            .handle(&event(StartPayload), &mut conversation)
+            .await
+            .unwrap();
+        assert!(!handler.title_tasks.contains_key(&conversation.id));
+
+        // No task was spawned, so the end event leaves the title unset.
+        handler
+            .handle(&event(EndPayload), &mut conversation)
+            .await
+            .unwrap();
+        assert!(conversation.title.is_none());
     }
 
     #[tokio::test]
